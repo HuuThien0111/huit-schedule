@@ -5,6 +5,14 @@ ini_set('display_errors', 1);
 
 require_once __DIR__ . '/db.php';
 
+// Hàm phụ trợ: Lấy số thứ tự của Ca học (1 -> 5) để tính khoảng cách giữa các ca
+function getShiftNumber(string $shiftStr): int {
+    if (preg_match('/Ca\s*(\d+)/i', $shiftStr, $matches)) {
+        return (int)$matches[1];
+    }
+    return 0;
+}
+
 // Xử lý các hành động thêm/xóa dữ liệu (POST)
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
@@ -21,7 +29,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if (!$teacher_id || !$branch_id || $subject_name === '' || $room === '' || $day_of_week === '' || $shift_or_periods === '') {
                 $_SESSION['flash'] = ['type' => 'warning', 'msg' => 'Vui lòng điền đầy đủ thông tin phân công lịch dạy!'];
             } else {
-                // 1. Kiểm tra trùng lịch giảng viên trên toàn bộ các cơ sở
+                // 1. XUNG ĐỘT CỨNG: Kiểm tra trùng lịch giảng viên trên toàn bộ cơ sở
                 $stmtTeacher = $pdo->prepare("
                     SELECT s.subject_name, s.room, b.branch_name 
                     FROM schedules s
@@ -32,7 +40,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $stmtTeacher->execute([$teacher_id, $day_of_week, $shift_or_periods]);
                 $conflictTeacher = $stmtTeacher->fetch(PDO::FETCH_ASSOC);
 
-                // 2. Kiểm tra trùng phòng học tại cơ sở được chọn
+                // 2. XUNG ĐỘT CỨNG: Kiểm tra trùng phòng học tại cơ sở được chọn
                 $stmtRoom = $pdo->prepare("
                     SELECT s.subject_name, t.full_name 
                     FROM schedules s
@@ -46,7 +54,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 if ($conflictTeacher) {
                     $_SESSION['flash'] = [
                         'type' => 'danger',
-                        'msg'  => "<strong>Trùng lịch giảng viên!</strong> Giảng viên này đã có lịch dạy môn <u>" . htmlspecialchars($conflictTeacher['subject_name']) . "</u> tại <strong>" . htmlspecialchars($conflictTeacher['branch_name']) . "</strong> (Phòng " . htmlspecialchars($conflictTeacher['room']) . ") vào <strong>$day_of_week ($shift_or_periods)</strong>."
+                        'msg'  => "<strong>Trùng lịch giảng viên!</strong> Giảng viên này đã dạy môn <u>" . htmlspecialchars($conflictTeacher['subject_name']) . "</u> tại <strong>" . htmlspecialchars($conflictTeacher['branch_name']) . "</strong> (Phòng " . htmlspecialchars($conflictTeacher['room']) . ") vào <strong>$day_of_week ($shift_or_periods)</strong>."
                     ];
                 } elseif ($conflictRoom) {
                     $_SESSION['flash'] = [
@@ -54,12 +62,48 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         'msg'  => "<strong>Trùng phòng học!</strong> Phòng <strong>$room</strong> tại cơ sở này đã được xếp cho <strong>" . htmlspecialchars($conflictRoom['full_name']) . "</strong> dạy môn <u>" . htmlspecialchars($conflictRoom['subject_name']) . "</u> vào <strong>$day_of_week ($shift_or_periods)</strong>."
                     ];
                 } else {
+                    // 3. CẢNH BÁO TỐI ƯU HÓA: Kiểm tra các ca khác trong cùng ngày của giảng viên
+                    $warnings = [];
+                    $newShiftNum = getShiftNumber($shift_or_periods);
+
+                    $stmtSameDay = $pdo->prepare("
+                        SELECT s.shift_or_periods, s.branch_id, b.branch_name 
+                        FROM schedules s
+                        JOIN branches b ON s.branch_id = b.id
+                        WHERE s.teacher_id = ? AND s.day_of_week = ?
+                    ");
+                    $stmtSameDay->execute([$teacher_id, $day_of_week]);
+                    $sameDaySchedules = $stmtSameDay->fetchAll(PDO::FETCH_ASSOC);
+
+                    foreach ($sameDaySchedules as $existing) {
+                        $oldShiftNum = getShiftNumber($existing['shift_or_periods']);
+                        $diff = abs($newShiftNum - $oldShiftNum);
+
+                        // Hai ca liền kề nhau (cách 1 ca) nhưng khác cơ sở
+                        if ($diff === 1 && (int)$existing['branch_id'] !== $branch_id) {
+                            $warnings[] = "<strong>Lưu ý di chuyển:</strong> Giảng viên phải di chuyển gấp giữa <u>" . htmlspecialchars($existing['branch_name']) . "</u> (" . htmlspecialchars($existing['shift_or_periods']) . ") và cơ sở mới trong 2 ca liền kề.";
+                        }
+                        // Cách nhau từ 2 ca trở lên -> Tạo khoảng trống chết giữa ngày
+                        if ($diff >= 2) {
+                            $warnings[] = "<strong>Lưu ý khoảng trống chết:</strong> Giảng viên có ca dạy lúc <u>" . htmlspecialchars($existing['shift_or_periods']) . "</u> và <u>$shift_or_periods</u> trong cùng $day_of_week (bị trống tiết ở giữa).";
+                        }
+                    }
+
+                    // Lưu lịch vào database
                     $stmtInsert = $pdo->prepare("
                         INSERT INTO schedules (teacher_id, branch_id, subject_name, room, day_of_week, shift_or_periods)
                         VALUES (?, ?, ?, ?, ?, ?)
                     ");
                     $stmtInsert->execute([$teacher_id, $branch_id, $subject_name, $room, $day_of_week, $shift_or_periods]);
-                    $_SESSION['flash'] = ['type' => 'success', 'msg' => 'Phân công lịch giảng dạy thành công!'];
+
+                    if (!empty($warnings)) {
+                        $_SESSION['flash'] = [
+                            'type' => 'warning',
+                            'msg'  => "<strong>Đã lưu lịch dạy thành công</strong>, nhưng hệ thống phát hiện vấn đề tối ưu:<br>• " . implode("<br>• ", $warnings)
+                        ];
+                    } else {
+                        $_SESSION['flash'] = ['type' => 'success', 'msg' => 'Phân công lịch giảng dạy thành công (Lịch tối ưu, không xung đột)!'];
+                    }
                 }
             }
         } elseif ($action === 'delete_schedule') {
@@ -98,15 +142,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     exit;
 }
 
-// Lấy thông báo flash (nếu có)
 $flash = $_SESSION['flash'] ?? null;
 unset($_SESSION['flash']);
 
-// Lấy danh sách cơ sở và giảng viên
-$branches = $pdo->query("SELECT * FROM branches ORDER BY id ASC")->fetchAll(PDO::FETCH_ASSOC);
-$teachers = $pdo->query("SELECT * FROM teachers ORDER BY full_name ASC")->fetchAll(PDO::FETCH_ASSOC);
+// Lấy dữ liệu danh mục
+$branches   = $pdo->query("SELECT * FROM branches ORDER BY id ASC")->fetchAll(PDO::FETCH_ASSOC);
+$teachers   = $pdo->query("SELECT * FROM teachers ORDER BY full_name ASC")->fetchAll(PDO::FETCH_ASSOC);
+$expertises = $pdo->query("SELECT DISTINCT expertise FROM teachers WHERE expertise IS NOT NULL AND expertise != '' ORDER BY expertise ASC")->fetchAll(PDO::FETCH_COLUMN);
 
-// Danh sách cố định Thứ và Ca học
 $daysOfWeek = ['Thứ 2', 'Thứ 3', 'Thứ 4', 'Thứ 5', 'Thứ 6', 'Thứ 7', 'Chủ nhật'];
 $shifts     = [
     'Ca 1 (Tiết 1 - 3)',
@@ -116,7 +159,7 @@ $shifts     = [
     'Ca 5 (Tiết 13 - 15)'
 ];
 
-// Lọc thời khóa biểu theo tham số GET
+// Lọc thời khóa biểu
 $filterBranch  = (int)($_GET['filter_branch'] ?? 0);
 $filterTeacher = (int)($_GET['filter_teacher'] ?? 0);
 $filterDay     = trim($_GET['filter_day'] ?? '');
@@ -130,10 +173,11 @@ if ($filterBranch > 0) {
 }
 if ($filterTeacher > 0) {
     $whereClauses[] = "s.teacher_id = ?";
-    $params[]       =$filterTeacher;
+    $params[]       = $filterTeacher;
 }
-if ($filterDay !== '') {$whereClauses[] = "s.day_of_week = ?";
-    $params[]       =$filterDay;
+if ($filterDay !== '') {
+    $whereClauses[] = "s.day_of_week = ?";
+    $params[]       = $filterDay;
 }
 
 $sqlSchedules = "
@@ -149,22 +193,50 @@ $sqlSchedules .= " ORDER BY FIELD(s.day_of_week, 'Thứ 2', 'Thứ 3', 'Thứ 4'
 
 $stmtSchedules = $pdo->prepare($sqlSchedules);
 $stmtSchedules->execute($params);
-$schedules =$stmtSchedules->fetchAll(PDO::FETCH_ASSOC);
+$schedules = $stmtSchedules->fetchAll(PDO::FETCH_ASSOC);
 
-// Tra cứu giảng viên trống lịch theo Thứ & Ca
-$checkDay   = trim($_GET['check_day'] ?? '');$checkShift = trim($_GET['check_shift'] ?? '');$freeTeachers = [];
+// GỢI Ý GIẢNG VIÊN PHÙ HỢP (Kết hợp Chuyên môn + Không trùng lịch)
+$checkDay       = trim($_GET['check_day'] ?? '');
+$checkShift     = trim($_GET['check_shift'] ?? '');
+$checkExpertise = trim($_GET['check_expertise'] ?? '');
+$freeTeachers   = [];
 
-if ($checkDay !== '' &&$checkShift !== '') {
-    $stmtFree =$pdo->prepare("
+if ($checkDay !== '' && $checkShift !== '') {
+    $sqlFree = "
         SELECT * FROM teachers 
         WHERE id NOT IN (
             SELECT teacher_id FROM schedules WHERE day_of_week = ? AND shift_or_periods = ?
         )
-        ORDER BY full_name ASC
-    ");
-    $stmtFree->execute([$checkDay,$checkShift]);
-    $freeTeachers =$stmtFree->fetchAll(PDO::FETCH_ASSOC);
+    ";
+    $freeParams = [$checkDay, $checkShift];
+
+    if ($checkExpertise !== '') {
+        $sqlFree .= " AND expertise = ?";
+        $freeParams[] = $checkExpertise;
+    }
+    $sqlFree .= " ORDER BY full_name ASC";
+
+    $stmtFree = $pdo->prepare($sqlFree);
+    $stmtFree->execute($freeParams);
+    $freeTeachers = $stmtFree->fetchAll(PDO::FETCH_ASSOC);
 }
+
+// DỮ LIỆU CHO BIỂU ĐỒ PHÂN BỔ THỜI GIAN (Chart.js)
+$chartTeacherData = $pdo->query("
+    SELECT t.full_name, COUNT(s.id) AS total_shifts
+    FROM teachers t
+    LEFT JOIN schedules s ON t.id = s.teacher_id
+    GROUP BY t.id, t.full_name
+    ORDER BY total_shifts DESC, t.full_name ASC
+")->fetchAll(PDO::FETCH_ASSOC);
+
+$chartBranchData = $pdo->query("
+    SELECT b.branch_name, COUNT(s.id) AS total_shifts
+    FROM branches b
+    LEFT JOIN schedules s ON b.id = s.branch_id
+    GROUP BY b.id, b.branch_name
+    ORDER BY b.id ASC
+")->fetchAll(PDO::FETCH_ASSOC);
 ?>
 <!DOCTYPE html>
 <html lang="vi">
@@ -190,6 +262,9 @@ if ($checkDay !== '' &&$checkShift !== '') {
             <i class="bi bi-calendar2-week-fill me-2"></i>HUIT SCHEDULE
         </a>
         <div class="ms-auto d-flex gap-2">
+            <a href="teacher.php" class="btn btn-warning btn-sm fw-semibold text-dark">
+                <i class="bi bi-person-badge me-1"></i>Cổng Giảng viên
+            </a>
             <button class="btn btn-light btn-sm fw-semibold" data-bs-toggle="modal" data-bs-target="#modalTeacher">
                 <i class="bi bi-person-plus-fill text-primary me-1"></i>Thêm Giảng viên
             </button>
@@ -201,7 +276,6 @@ if ($checkDay !== '' &&$checkShift !== '') {
 </nav>
 
 <div class="container pb-5">
-    <!-- Thông báo trạng thái -->
     <?php if ($flash): ?>
         <div class="alert alert-<?= htmlspecialchars($flash['type']) ?> alert-dismissible fade show shadow-sm" role="alert">
             <?= $flash['msg'] ?>
@@ -246,12 +320,12 @@ if ($checkDay !== '' &&$checkShift !== '') {
         </div>
     </div>
 
-    <div class="row g-4">
-        <!-- Cột trái: Form phân công lịch + Gợi ý giảng viên trống lịch -->
+    <div class="row g-4 mb-4">
+        <!-- Cột trái: Form phân công & Gợi ý giảng viên phù hợp -->
         <div class="col-lg-4">
             <div class="card mb-4">
                 <div class="card-header bg-primary text-white">
-                    <i class="bi bi-plus-circle me-1"></i> Phân công Lịch Giảng Dạy
+                    <i class="bi bi-plus-circle me-1"></i> Phân công & Tối ưu Lịch dạy
                 </div>
                 <div class="card-body">
                     <form method="POST" action="index.php">
@@ -261,7 +335,7 @@ if ($checkDay !== '' &&$checkShift !== '') {
                             <label class="form-label fw-semibold">Giảng viên</label>
                             <select name="teacher_id" class="form-select" required>
                                 <option value="">-- Chọn giảng viên --</option>
-                                <?php foreach ($teachers as$t): ?>
+                                <?php foreach ($teachers as $t): ?>
                                     <option value="<?= $t['id'] ?>">
                                         <?= htmlspecialchars($t['full_name']) ?> (<?= htmlspecialchars($t['expertise']) ?>)
                                     </option>
@@ -273,7 +347,7 @@ if ($checkDay !== '' &&$checkShift !== '') {
                             <label class="form-label fw-semibold">Cơ sở giảng dạy</label>
                             <select name="branch_id" class="form-select" required>
                                 <option value="">-- Chọn cơ sở --</option>
-                                <?php foreach ($branches as$b): ?>
+                                <?php foreach ($branches as $b): ?>
                                     <option value="<?= $b['id'] ?>"><?= htmlspecialchars($b['branch_name']) ?></option>
                                 <?php endforeach; ?>
                             </select>
@@ -288,7 +362,7 @@ if ($checkDay !== '' &&$checkShift !== '') {
                             <div class="col-6">
                                 <label class="form-label fw-semibold">Thứ</label>
                                 <select name="day_of_week" class="form-select" required>
-                                    <?php foreach ($daysOfWeek as$d): ?>
+                                    <?php foreach ($daysOfWeek as $d): ?>
                                         <option value="<?= $d ?>"><?= $d ?></option>
                                     <?php endforeach; ?>
                                 </select>
@@ -302,31 +376,41 @@ if ($checkDay !== '' &&$checkShift !== '') {
                         <div class="mb-3">
                             <label class="form-label fw-semibold">Ca học / Tiết học</label>
                             <select name="shift_or_periods" class="form-select" required>
-                                <?php foreach ($shifts as$s): ?>
+                                <?php foreach ($shifts as $s): ?>
                                     <option value="<?= $s ?>"><?= $s ?></option>
                                 <?php endforeach; ?>
                             </select>
                         </div>
 
                         <button type="submit" class="btn btn-primary w-100 fw-semibold">
-                            <i class="bi bi-check2-circle me-1"></i> Lưu & Kiểm tra trùng lịch
+                            <i class="bi bi-cpu me-1"></i> Lưu & Kiểm tra tối ưu
                         </button>
                     </form>
                 </div>
             </div>
 
-            <!-- Tra cứu giảng viên rảnh -->
+            <!-- Gợi ý giảng viên phù hợp (Chuyên môn + Không trùng lịch) -->
             <div class="card">
                 <div class="card-header bg-success text-white">
-                    <i class="bi bi-search me-1"></i> Gợi ý Giảng viên Trống lịch
+                    <i class="bi bi-lightbulb-fill me-1"></i> Gợi ý Giảng viên Phù hợp
                 </div>
                 <div class="card-body">
                     <form method="GET" action="index.php">
+                        <div class="mb-2">
+                            <select name="check_expertise" class="form-select form-select-sm">
+                                <option value="">-- Tất cả Chuyên môn --</option>
+                                <?php foreach ($expertises as $exp): ?>
+                                    <option value="<?= htmlspecialchars($exp) ?>" <?= $checkExpertise === $exp ? 'selected' : '' ?>>
+                                        Chuyên môn: <?= htmlspecialchars($exp) ?>
+                                    </option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
                         <div class="row g-2 mb-2">
                             <div class="col-5">
                                 <select name="check_day" class="form-select form-select-sm" required>
                                     <option value="">Chọn Thứ</option>
-                                    <?php foreach ($daysOfWeek as$d): ?>
+                                    <?php foreach ($daysOfWeek as $d): ?>
                                         <option value="<?= $d ?>" <?= $checkDay === $d ? 'selected' : '' ?>><?= $d ?></option>
                                     <?php endforeach; ?>
                                 </select>
@@ -334,30 +418,30 @@ if ($checkDay !== '' &&$checkShift !== '') {
                             <div class="col-7">
                                 <select name="check_shift" class="form-select form-select-sm" required>
                                     <option value="">Chọn Ca học</option>
-                                    <?php foreach ($shifts as$s): ?>
+                                    <?php foreach ($shifts as $s): ?>
                                         <option value="<?= $s ?>" <?= $checkShift === $s ? 'selected' : '' ?>><?= $s ?></option>
                                     <?php endforeach; ?>
                                 </select>
                             </div>
                         </div>
                         <button type="submit" class="btn btn-outline-success btn-sm w-100 fw-semibold">
-                            Tìm giảng viên rảnh
+                            <i class="bi bi-search me-1"></i> Tìm giảng viên phù hợp
                         </button>
                     </form>
 
-                    <?php if ($checkDay !== '' &&$checkShift !== ''): ?>
+                    <?php if ($checkDay !== '' && $checkShift !== ''): ?>
                         <hr>
                         <div class="small fw-semibold text-muted mb-2">
-                            Giảng viên trống lịch vào <?= htmlspecialchars($checkDay) ?> - <?= htmlspecialchars($checkShift) ?>:
+                            Kết quả trống lịch (<?= htmlspecialchars($checkDay) ?> - <?= htmlspecialchars($checkShift) ?>):
                         </div>
                         <?php if (empty($freeTeachers)): ?>
-                            <div class="text-danger small">Không còn giảng viên nào trống trong ca này.</div>
+                            <div class="text-danger small">Không tìm thấy giảng viên phù hợp đang trống lịch.</div>
                         <?php else: ?>
                             <ul class="list-group list-group-flush small">
-                                <?php foreach ($freeTeachers as$ft): ?>
+                                <?php foreach ($freeTeachers as $ft): ?>
                                     <li class="list-group-item px-0 d-flex justify-content-between align-items-center">
                                         <span><strong><?= htmlspecialchars($ft['full_name']) ?></strong></span>
-                                        <span class="badge bg-light text-dark border"><?= htmlspecialchars($ft['expertise']) ?></span>
+                                        <span class="badge bg-success-subtle text-success border border-success-subtle"><?= htmlspecialchars($ft['expertise']) ?></span>
                                     </li>
                                 <?php endforeach; ?>
                             </ul>
@@ -369,20 +453,19 @@ if ($checkDay !== '' &&$checkShift !== '') {
 
         <!-- Cột phải: Bộ lọc & Bảng thời khóa biểu -->
         <div class="col-lg-8">
-            <div class="card">
+            <div class="card mb-4">
                 <div class="card-header bg-white d-flex justify-content-between align-items-center py-3">
                     <span class="text-primary fs-6"><i class="bi bi-table me-1"></i> Danh sách Thời Khóa Biểu Đa Cơ Sở</span>
-                    <?php if ($filterBranch || $filterTeacher ||$filterDay): ?>
+                    <?php if ($filterBranch || $filterTeacher || $filterDay): ?>
                         <a href="index.php" class="btn btn-sm btn-outline-secondary">Xóa bộ lọc</a>
                     <?php endif; ?>
                 </div>
                 <div class="card-body">
-                    <!-- Thanh bộ lọc -->
                     <form method="GET" action="index.php" class="row g-2 mb-3">
                         <div class="col-md-4">
                             <select name="filter_branch" class="form-select form-select-sm">
                                 <option value="0">-- Tất cả Cơ sở --</option>
-                                <?php foreach ($branches as$b): ?>
+                                <?php foreach ($branches as $b): ?>
                                     <option value="<?= $b['id'] ?>" <?= $filterBranch === (int)$b['id'] ? 'selected' : '' ?>>
                                         <?= htmlspecialchars($b['branch_name']) ?>
                                     </option>
@@ -392,7 +475,7 @@ if ($checkDay !== '' &&$checkShift !== '') {
                         <div class="col-md-4">
                             <select name="filter_teacher" class="form-select form-select-sm">
                                 <option value="0">-- Tất cả Giảng viên --</option>
-                                <?php foreach ($teachers as$t): ?>
+                                <?php foreach ($teachers as $t): ?>
                                     <option value="<?= $t['id'] ?>" <?= $filterTeacher === (int)$t['id'] ? 'selected' : '' ?>>
                                         <?= htmlspecialchars($t['full_name']) ?>
                                     </option>
@@ -402,7 +485,7 @@ if ($checkDay !== '' &&$checkShift !== '') {
                         <div class="col-md-2">
                             <select name="filter_day" class="form-select form-select-sm">
                                 <option value="">-- Thứ --</option>
-                                <?php foreach ($daysOfWeek as$d): ?>
+                                <?php foreach ($daysOfWeek as $d): ?>
                                     <option value="<?= $d ?>" <?= $filterDay === $d ? 'selected' : '' ?>><?= $d ?></option>
                                 <?php endforeach; ?>
                             </select>
@@ -414,7 +497,6 @@ if ($checkDay !== '' &&$checkShift !== '') {
                         </div>
                     </form>
 
-                    <!-- Bảng dữ liệu -->
                     <div class="table-responsive">
                         <table class="table table-hover align-middle border">
                             <thead class="table-light">
@@ -430,11 +512,11 @@ if ($checkDay !== '' &&$checkShift !== '') {
                                 <?php if (empty($schedules)): ?>
                                     <tr>
                                         <td colspan="5" class="text-center text-muted py-4">
-                                            Chưa có lịch giảng dạy nào phù hợp. Hãy thêm lịch mới ở khung bên trái!
+                                            Chưa có lịch giảng dạy nào phù hợp.
                                         </td>
                                     </tr>
                                 <?php else: ?>
-                                    <?php foreach ($schedules as$row): ?>
+                                    <?php foreach ($schedules as $row): ?>
                                         <tr>
                                             <td>
                                                 <div class="fw-bold text-dark"><?= htmlspecialchars($row['day_of_week']) ?></div>
@@ -468,6 +550,30 @@ if ($checkDay !== '' &&$checkShift !== '') {
                     </div>
                 </div>
             </div>
+
+            <!-- Biểu đồ phân bổ thời gian -->
+            <div class="row g-3">
+                <div class="col-md-7">
+                    <div class="card h-100">
+                        <div class="card-header bg-white text-dark">
+                            <i class="bi bi-bar-chart-fill text-primary me-1"></i> Phân bổ số ca theo Giảng viên
+                        </div>
+                        <div class="card-body">
+                            <canvas id="teacherChart" height="180"></canvas>
+                        </div>
+                    </div>
+                </div>
+                <div class="col-md-5">
+                    <div class="card h-100">
+                        <div class="card-header bg-white text-dark">
+                            <i class="bi bi-pie-chart-fill text-success me-1"></i> Tỷ lệ ca theo Cơ sở
+                        </div>
+                        <div class="card-body">
+                            <canvas id="branchChart" height="180"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
 </div>
@@ -488,4 +594,100 @@ if ($checkDay !== '' &&$checkShift !== '') {
                 </div>
                 <div class="mb-3">
                     <label class="form-label">Email</label>
-                    <input type="email" name="email" class="
+                    <input type="email" name="email" class="form-control" placeholder="tuanpm@huit.edu.vn" required>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Số điện thoại</label>
+                    <input type="text" name="phone" class="form-control" placeholder="0909xxxxxx">
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Chuyên môn / Bộ môn</label>
+                    <input type="text" name="expertise" class="form-control" placeholder="VD: Công nghệ Phần mềm" required>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Đóng</button>
+                <button type="submit" class="btn btn-primary">Lưu Giảng viên</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<!-- Modal Thêm Cơ Sở -->
+<div class="modal fade" id="modalBranch" tabindex="-1">
+    <div class="modal-dialog">
+        <form method="POST" action="index.php" class="modal-content">
+            <input type="hidden" name="action" value="add_branch">
+            <div class="modal-header">
+                <h5 class="modal-title fw-bold">Thêm Cơ sở Đào tạo</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="mb-3">
+                    <label class="form-label">Tên cơ sở</label>
+                    <input type="text" name="branch_name" class="form-control" placeholder="VD: Cơ sở 3 - Tây Thạnh" required>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Địa chỉ</label>
+                    <input type="text" name="address" class="form-control" placeholder="Số đường, Phường, Quận..." required>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Đóng</button>
+                <button type="submit" class="btn btn-primary">Lưu Cơ sở</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<script>
+    // Dữ liệu từ PHP truyền sang JavaScript
+    const teacherLabels = <?= json_encode(array_column($chartTeacherData, 'full_name'), JSON_UNESCAPED_UNICODE) ?>;
+    const teacherCounts = <?= json_encode(array_map('intval', array_column($chartTeacherData, 'total_shifts'))) ?>;
+
+    const branchLabels  = <?= json_encode(array_column($chartBranchData, 'branch_name'), JSON_UNESCAPED_UNICODE) ?>;
+    const branchCounts  = <?= json_encode(array_map('intval', array_column($chartBranchData, 'total_shifts'))) ?>;
+
+    // 1. Biểu đồ cột phân bổ theo Giảng viên
+    new Chart(document.getElementById('teacherChart'), {
+        type: 'bar',
+        data: {
+            labels: teacherLabels,
+            datasets: [{
+                label: 'Số ca giảng dạy',
+                data: teacherCounts,
+                backgroundColor: '#0072ce',
+                borderRadius: 6
+            }]
+        },
+        options: {
+            responsive: true,
+            plugins: { legend: { display: false } },
+            scales: {
+                y: { beginAtZero: true, ticks: { stepSize: 1 } }
+            }
+        }
+    });
+
+    // 2. Biểu đồ tròn phân bổ theo Cơ sở
+    new Chart(document.getElementById('branchChart'), {
+        type: 'doughnut',
+        data: {
+            labels: branchLabels,
+            datasets: [{
+                data: branchCounts,
+                backgroundColor: ['#004b8d', '#198754', '#ffc107', '#dc3545', '#6f42c1']
+            }]
+        },
+        options: {
+            responsive: true,
+            plugins: {
+                legend: { position: 'bottom', labels: { boxWidth: 12, font: { size: 11 } } }
+            }
+        }
+    });
+</script>
+</body>
+</html>
